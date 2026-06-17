@@ -14,7 +14,11 @@ Usage
     # Check system health:
     python main.py --health
 
+    # Week 2 browser smoke test:
+    python main.py --browse "https://en.wikipedia.org/wiki/Python_(programming_language)"
+
 Week 1: creates a Task record, writes it to SQLite, prints the task_id.
+Week 2: --browse opens a real browser and extracts page text.
 Week 3: adds Orchestrator call so the agent actually executes the goal.
 """
 
@@ -50,6 +54,11 @@ def _parse_args() -> argparse.Namespace:
         "--health",
         action="store_true",
         help="Check system health and exit.",
+    )
+    parser.add_argument(
+        "--browse",
+        metavar="URL",
+        help="Week 2 smoke test: open URL, extract page text, print results.",
     )
     parser.add_argument(
         "--goal-type",
@@ -95,6 +104,82 @@ async def run_health_check() -> None:
     print("\n  System ready.")
 
 
+async def run_browse(url: str) -> None:
+    """
+    Week 2 smoke test.
+
+    Opens a real browser, navigates to the URL, runs every action
+    once, prints results. Confirms the browser layer works end-to-end
+    before the Planner and Execution Engine are built.
+    """
+    from browser.controller import BrowserController
+
+    logger = get_logger(__name__)
+    print(f"\n  Opening browser → {url}")
+    print("  " + "─" * 50)
+
+    async with BrowserController() as browser:
+
+        # 1. navigate
+        result = await browser.navigate(url)
+        if not result.success:
+            print(f"  [FAIL] navigate: {result.error}")
+            return
+        print(f"  [OK]   navigate   → title: {result.output['title'][:60]}")
+        print(f"                      url:   {result.output['url'][:60]}")
+
+        # 2. extract_page — full readable text
+        result = await browser.extract_page()
+        if not result.success:
+            print(f"  [FAIL] extract_page: {result.error}")
+        else:
+            text = result.output["text"]
+            preview = text[:300].replace("\n", " ")
+            print(f"  [OK]   extract_page → {result.output['char_count']} chars")
+            print(f"                        preview: {preview!r}")
+
+        # 3. get_links
+        result = await browser.get_links()
+        if not result.success:
+            print(f"  [FAIL] get_links: {result.error}")
+        else:
+            links = result.output["links"]
+            print(f"  [OK]   get_links   → {result.output['count']} links found")
+            for link in links[:3]:
+                print(f"                        {link['text'][:30]!r:32} → {link['href'][:50]}")
+
+        # 4. get_dom_snapshot
+        result = await browser.get_dom_snapshot()
+        if not result.success:
+            print(f"  [FAIL] get_dom_snapshot: {result.error}")
+        else:
+            snap = result.output["snapshot"]
+            first_lines = "\n".join(snap.splitlines()[:6])
+            print(f"  [OK]   dom_snapshot → {len(snap.splitlines())} lines")
+            print(f"         {first_lines[:200]}")
+
+        # 5. scroll
+        result = await browser.scroll("down", 300)
+        if not result.success:
+            print(f"  [FAIL] scroll: {result.error}")
+        else:
+            print(f"  [OK]   scroll      → scrollY: {result.output['scroll_y']}px")
+
+        # 6. screenshot
+        result = await browser.screenshot()
+        if not result.success:
+            print(f"  [FAIL] screenshot: {result.error}")
+        else:
+            print(f"  [OK]   screenshot  → {result.output['size']:,} bytes (PNG)")
+
+        print()
+        print(f"  current url:   {await browser.current_url()}")
+        print(f"  current title: {await browser.current_title()}")
+        print()
+        print("  Browser layer: ALL ACTIONS OK")
+        print("  Week 2 exit criterion met.")
+
+
 async def run_goal(goal: str, goal_type_str: str) -> None:
     logger = get_logger(__name__)
 
@@ -132,14 +217,13 @@ def serve(host: str, port: int) -> None:
         host=host,
         port=port,
         reload=False,
-        log_config=None,  # suppress uvicorn's default logger — we use ours
+        log_config=None,
     )
 
 
 def main() -> None:
     args = _parse_args()
 
-    # Logging and DB must be ready before anything else
     setup_logging()
     init_db()
 
@@ -156,10 +240,15 @@ def main() -> None:
         asyncio.run(run_health_check())
         return
 
+    if args.browse:
+        asyncio.run(run_browse(args.browse))
+        return
+
     if not args.goal:
         print("Usage: python main.py \"your goal here\"")
         print("       python main.py --serve")
         print("       python main.py --health")
+        print("       python main.py --browse https://example.com")
         sys.exit(1)
 
     asyncio.run(run_goal(args.goal, args.goal_type))
