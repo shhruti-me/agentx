@@ -5,7 +5,6 @@ OllamaProvider — default LLM backend for AGENTX.
 
 Calls Ollama's REST API directly with httpx.
 No Ollama SDK. No extra dependencies beyond httpx.
-
 Ollama API used:
   POST /api/chat       — text generation
   GET  /api/tags       — health check (lists loaded models)

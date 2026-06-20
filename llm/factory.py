@@ -24,12 +24,12 @@ Usage
 
 from __future__ import annotations
 
-import logging
+from log.logger import get_logger
 
 from config.settings import settings
 from llm.base import LLMProvider
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Module-level cache — provider is instantiated once per process.
 # get_llm_client() is called frequently (once per LLM call site);
@@ -95,8 +95,17 @@ def get_llm_client(force_refresh: bool = False) -> LLMProvider:
             api_key=settings.openai_api_key,
         )
 
+    elif provider_name == "groq":
+        from llm.groq import GroqProvider
+
+        _provider_instance = GroqProvider(
+            model=settings.llm_model,
+            api_key=settings.groq_api_key,
+            timeout_seconds=settings.llm_timeout_seconds,
+        )
+
     else:
-        supported = ("ollama", "anthropic", "openai")
+        supported = ("ollama", "anthropic", "openai", "groq")
         raise ValueError(
             f"Unknown LLM_PROVIDER: {provider_name!r}. "
             f"Supported values: {supported}. "

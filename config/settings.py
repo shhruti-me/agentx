@@ -97,6 +97,13 @@ class Settings(BaseSettings):
         default="",
         description="OpenAI API key. Only required when LLM_PROVIDER=openai.",
     )
+    groq_api_key: str = Field(
+        default="",
+        description=(
+            "Groq API key. Only required when LLM_PROVIDER=groq. "
+            "Free key at https://console.groq.com"
+        ),
+    )
 
     # ── Database ──────────────────────────────────────────────────────
     db_path: Path = Field(

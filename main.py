@@ -31,8 +31,6 @@ import sys
 from config.settings import settings
 from log.logger import get_logger, setup_logging
 from memory.db import init_db
-from memory.task_memory import write_task
-from core.models import GoalType, Task
 
 
 def _parse_args() -> argparse.Namespace:
@@ -58,7 +56,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--browse",
         metavar="URL",
-        help="Week 2 smoke test: open URL, extract page text, print results.",
+        help="Week 2 smoke test: open URL, exercise all browser actions.",
     )
     parser.add_argument(
         "--goal-type",
@@ -95,10 +93,10 @@ async def run_health_check() -> None:
     print(f"  db_path:  {settings.db_path}")
 
     if not db_ok:
-        print("\n  [!] Database error. Run init_db() or check db/ directory permissions.")
+        print("\n  [!] Database error.")
         sys.exit(1)
     if not llm_ok:
-        print(f"\n  [!] LLM provider unavailable. For Ollama: run 'ollama serve' then 'ollama pull {settings.llm_model}'")
+        print(f"\n  [!] LLM unavailable. Run: ollama serve && ollama pull {settings.llm_model}")
         sys.exit(1)
 
     print("\n  System ready.")
@@ -114,7 +112,6 @@ async def run_browse(url: str) -> None:
     """
     from browser.controller import BrowserController
 
-    logger = get_logger(__name__)
     print(f"\n  Opening browser → {url}")
     print("  " + "─" * 50)
 
@@ -165,7 +162,6 @@ async def run_browse(url: str) -> None:
         else:
             print(f"  [OK]   scroll      → scrollY: {result.output['scroll_y']}px")
 
-        # 6. screenshot
         result = await browser.screenshot()
         if not result.success:
             print(f"  [FAIL] screenshot: {result.error}")
@@ -180,34 +176,34 @@ async def run_browse(url: str) -> None:
         print("  Week 2 exit criterion met.")
 
 
-async def run_goal(goal: str, goal_type_str: str) -> None:
+async def run_goal(goal: str, goal_type: str) -> None:
+    from core.orchestrator import Orchestrator
+
     logger = get_logger(__name__)
+    logger.info("goal_submitted", goal=goal[:80], goal_type=goal_type)
 
-    try:
-        goal_type = GoalType(goal_type_str)
-    except ValueError:
-        goal_type = GoalType.UNKNOWN
-
-    task = Task(goal=goal, goal_type=goal_type)
-    write_task(task)
-
-    logger.info(
-        "task_submitted",
-        task_id=task.id,
-        goal=goal[:80],
-        goal_type=goal_type,
-    )
-
-    print(f"\n  Task created")
-    print(f"  ID:        {task.id}")
-    print(f"  Status:    {task.status}")
-    print(f"  Goal:      {goal}")
-    print(f"  Goal type: {goal_type}")
+    print(f"\n  Goal:      {goal}")
+    print(f"  Type:      {goal_type}")
+    print(f"  Model:     {settings.llm_model}")
     print()
-    print("  Week 1: task is written to SQLite but not yet executed.")
-    print("  The Orchestrator (Week 3) will execute it.")
+
+    orchestrator = Orchestrator()
+    task = await orchestrator.run(goal=goal, goal_type=goal_type)
+
     print()
-    print(f"  Check status: GET /v1/status/{task.id}")
+    print("  " + "═" * 50)
+    print(f"  Task ID:     {task.id}")
+    print(f"  Status:      {task.status.value}")
+    print(f"  Steps:       {task.steps_taken}")
+    print(f"  Corrections: {task.corrections}")
+    print(f"  Tokens:      {task.tokens_used}")
+    if task.duration_seconds:
+        print(f"  Duration:    {task.duration_seconds:.1f}s")
+    print()
+    print("  RESULT:")
+    print("  " + "─" * 50)
+    print(f"  {task.result}")
+    print("  " + "═" * 50)
 
 
 def serve(host: str, port: int) -> None:
@@ -229,8 +225,6 @@ def main() -> None:
 
     if args.serve:
         print(f"  Starting AGENTX API on http://{args.host}:{args.port}")
-        print(f"  Docs: http://{args.host}:{args.port}/docs")
-        print(f"  API key: {settings.api_key}")
         serve(args.host, args.port)
         return
 
