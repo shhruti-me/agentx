@@ -173,6 +173,15 @@ class Planner:
             f"  - {s.tool}({s.input}): SUCCESS" for s in completed_steps
         )
 
+        page_hint = ""
+        if page_text and len(page_text) > 100:
+            page_hint = (
+                "IMPORTANT: The page text above may already contain the answer. "
+                "If the goal is to extract specific information and you can see it "
+                "in the page text, use extract_page as the single remaining step "
+                "rather than trying more CSS selectors."
+            )
+
         prompt = f"""Original goal: {goal}
 
 Steps already completed successfully:
@@ -187,10 +196,12 @@ Step that FAILED:
 Current page content (first 3000 chars):
 {page_text[:3000]}
 
+{page_hint}
+
 The original plan has failed at the step above.
-Generate a NEW sequence of steps to complete the original goal from this point forward.
+Generate a NEW minimal sequence of steps to complete the original goal from this point.
 Do NOT repeat the steps that already succeeded.
-Account for what you can see in the current page content.
+If the answer is visible in the page content above, use extract_page to get it.
 Respond with ONLY a JSON array of remaining steps."""
 
         try:

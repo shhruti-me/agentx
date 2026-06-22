@@ -237,8 +237,11 @@ async def extract(
     Used for targeted extraction when the Planner knows the exact selector.
     """
     start = time.monotonic()
+    # Use a shorter timeout for selector existence check — if it's not found
+    # quickly, it likely doesn't exist. Correction engine handles the retry.
+    selector_timeout = min(timeout_ms, 10_000)
     try:
-        await page.wait_for_selector(selector, state="attached", timeout=timeout_ms)
+        await page.wait_for_selector(selector, state="attached", timeout=selector_timeout)
         elements = await page.query_selector_all(selector)
 
         if not elements:
@@ -333,60 +336,57 @@ async def get_dom_snapshot(page: "Page") -> ActionResult:
     """
     Return a compact DOM outline of the current page for LLM consumption.
 
-    Uses JavaScript to walk the live DOM directly — not page.content().
-    Captures tag, id, class, href, and a text preview for each element.
-    Capped at 150 elements to keep LLM prompt size manageable.
-
-    Used by the Self-Correction Engine's selector_fix strategy.
+    Uses JavaScript to walk the live DOM directly.
+    Depth 8, MAX 200 elements, includes tbody for table-heavy sites (HN).
+    Used by selector_fix to find alternative selectors.
     """
     start = time.monotonic()
     try:
-        snapshot = await page.evaluate("""
-        () => {
-            const INCLUDE = new Set([
-                'body','main','article','section','nav','header','footer',
-                'h1','h2','h3','h4','h5','h6',
-                'p','a','button','input','textarea','select','form',
-                'ul','ol','li','table','tr','td','th','div','span'
-            ]);
-            const SKIP = new Set(['script','style','noscript','svg','path']);
-            const lines = [];
-            const MAX = 150;
+        # Build JS as a raw string to avoid Python escape conflicts
+        js = (
+            "() => {"
+            "  const INC = new Set(['body','main','article','section','nav','header','footer',"
+            "    'h1','h2','h3','h4','h5','h6','p','a','button','input','textarea','select','form',"
+            "    'ul','ol','li','table','tbody','tr','td','th','div','span']);"
+            "  const SKIP = new Set(['script','style','noscript','svg','path','head']);"
+            "  const lines = [];"
+            "  const MAX = 200;"
+            "  function walk(el, depth) {"
+            "    if (lines.length >= MAX || depth > 8) return;"
+            "    const tag = el.tagName ? el.tagName.toLowerCase() : '';"
+            "    if (!tag || SKIP.has(tag)) return;"
+            "    if (INC.has(tag)) {"
+            "      let label = tag;"
+            "      if (el.id) label += '#' + el.id;"
+            "      const cls = Array.from(el.classList).slice(0,3).join('.');"
+            "      if (cls) label += '.' + cls;"
+            "      if (tag === 'a') {"
+            "        const href = el.getAttribute('href') || '';"
+            "        if (href) label += ' href=\"' + href.slice(0,80) + '\"';"
+            "      }"
+            "      if (tag === 'input' && el.type) label += ' type=\"' + el.type + '\"';"
+            "      const dt = Array.from(el.childNodes)"
+            "        .filter(function(n){return n.nodeType===3;})"
+            "        .map(function(n){return n.textContent.trim();})"
+            "        .join(' ').trim().slice(0,60);"
+            "      if (dt) label += ' \"' + dt + '\"';"
+            "      lines.push('  '.repeat(depth) + label);"
+            "    }"
+            "    for (let i=0;i<el.children.length;i++) walk(el.children[i], depth+1);"
+            "  }"
+            "  walk(document.body, 0);"
+            "  if (lines.length >= MAX) lines.push('[...more elements]');"
+            "  return lines.join('\\n');"
+            "}"
+        )
 
-            function walk(el, depth) {
-                if (lines.length >= MAX) return;
-                if (depth > 5) return;
+        snapshot = await page.evaluate(js)
 
-                const tag = el.tagName ? el.tagName.toLowerCase() : '';
-                if (!tag || SKIP.has(tag)) return;
+        if not snapshot:
+            snapshot = ""
 
-                if (INCLUDE.has(tag)) {
-                    let label = tag;
-                    if (el.id) label += '#' + el.id;
-                    const cls = Array.from(el.classList).slice(0, 2).join('.');
-                    if (cls) label += '.' + cls;
-                    if (tag === 'a' && el.href) label += ' href="' + el.href.slice(0, 60) + '"';
-                    if (tag === 'input') {
-                        if (el.type) label += ' type="' + el.type + '"';
-                        if (el.placeholder) label += ' placeholder="' + el.placeholder.slice(0, 40) + '"';
-                    }
-                    const text = el.innerText ? el.innerText.trim().slice(0, 80) : '';
-                    if (text) label += ' "' + text.replace(/\\n/g, ' ') + '"';
-                    lines.push('  '.repeat(depth) + label);
-                }
-
-                for (const child of el.children) {
-                    walk(child, depth + 1);
-                }
-            }
-
-            walk(document.body, 0);
-            if (lines.length >= MAX) lines.push('[...more elements]');
-            return lines.join('\\n');
-        }
-        """)
-
-        logger.info("action_dom_snapshot", chars=len(snapshot), lines=snapshot.count('\n') + 1)
+        line_count = len(snapshot.splitlines()) if snapshot else 0
+        logger.info("action_dom_snapshot", chars=len(snapshot), lines=line_count)
         return ActionResult.ok(
             output={"snapshot": snapshot},
             duration_ms=_elapsed(start),
@@ -396,9 +396,6 @@ async def get_dom_snapshot(page: "Page") -> ActionResult:
             error=f"DOM snapshot failed: {exc}",
             duration_ms=_elapsed(start),
         )
-
-
-# ── get_links ─────────────────────────────────────────────────────────────────
 
 
 async def get_links(page: "Page") -> ActionResult:

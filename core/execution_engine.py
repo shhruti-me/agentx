@@ -141,7 +141,7 @@ class ExecutionEngine:
         from verification.verifier import Verifier
         from correction.engine import SelfCorrectionEngine
 
-        verifier = Verifier()
+        verifier = Verifier(browser=self._browser)
         corrector = SelfCorrectionEngine(browser=self._browser, task=self._task)
 
         step.mark_running()
@@ -200,11 +200,23 @@ class ExecutionEngine:
             return False, f"Step aborted: {correction.reason}"
 
         if correction.strategy_used == CorrectionStrategy.REPLAN and correction.new_dag:
-            # Replace remaining steps with the new plan
+            # Replace remaining steps with the new plan and re-index them
             current_idx = step.step_index
-            dag.steps = dag.steps[: current_idx] + correction.new_dag.steps
+            new_steps = correction.new_dag.steps
+            for i, s in enumerate(new_steps):
+                s.step_index = current_idx + i
+                s.task_id = self._task.id
+            dag.steps = dag.steps[: current_idx] + new_steps
             step.mark_failed(f"Replanned: {correction.reason}")
-            return True, ""  # Engine loop will pick up new steps
+            # Execute the new steps immediately
+            replan_result = ""
+            for new_step in new_steps:
+                success, result = await self._execute_step(new_step, dag)
+                if not success:
+                    return False, result
+                if result:
+                    replan_result = result
+            return True, replan_result
 
         if correction.success:
             # RETRY or SELECTOR_FIX succeeded — re-run this step
