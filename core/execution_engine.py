@@ -219,26 +219,64 @@ class ExecutionEngine:
             return True, replan_result
 
         if correction.success:
-            # RETRY or SELECTOR_FIX succeeded — re-run this step
+            # RETRY or SELECTOR_FIX will be tried — mark the failure with
+            # recovery attempt so memory knows this strategy was attempted
+            # The was_recovered flag will be updated when re-execution succeeds
             return await self._execute_step(step, dag)
 
         step.mark_failed(correction.reason)
         return False, f"Step failed after correction: {correction.reason}"
 
     def _write_success(self, step: Step, result: ActionResult) -> None:
-        """Write successful action to memory for future planning context."""
+        """Write successful action to memory and to the steps table."""
         try:
             url = self._browser._page.url if self._browser._page else ""
+            goal_type = str(self._task.goal_type.value) if hasattr(self._task.goal_type, "value") else str(self._task.goal_type)
             write_success(
                 tool=step.tool,
                 context=f"Step {step.step_index}: {step.expected[:100]}",
                 input_data=step.input,
                 output_data=result.output or {},
-                goal_type=self._task.goal_type,
+                goal_type=goal_type,
                 site_domain=domain_from_url(url),
             )
+            self._write_step(step)
         except Exception as exc:
             logger.warning("memory_write_success_failed", error=str(exc))
+
+    def _write_step(self, step: Step) -> None:
+        """Persist step record to the steps table."""
+        try:
+            import json
+            from memory.db import get_connection
+            from datetime import datetime, timezone
+            with get_connection() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO steps (
+                        id, task_id, step_index, tool,
+                        input_json, output_json, expected,
+                        status, retry_count,
+                        started_at, completed_at, error_message
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        step.id,
+                        step.task_id,
+                        step.step_index,
+                        step.tool,
+                        json.dumps(step.input, default=str),
+                        json.dumps(step.output or {}, default=str),
+                        step.expected,
+                        str(step.status),
+                        step.retry_count,
+                        step.started_at.isoformat() if step.started_at else None,
+                        step.completed_at.isoformat() if step.completed_at else None,
+                        step.error_message,
+                    ),
+                )
+        except Exception as exc:
+            logger.warning("step_write_failed", error=str(exc))
 
     def _write_failure(
         self,
@@ -246,6 +284,7 @@ class ExecutionEngine:
         result: ActionResult,
         verification,
         strategy_used,
+        was_recovered: bool = False,
     ) -> None:
         """Write failure event to memory so future corrections skip tried strategies."""
         try:
@@ -255,7 +294,7 @@ class ExecutionEngine:
                 input_data=step.input,
                 error_message=result.error or verification.reason,
                 correction_used=strategy_used,
-                was_recovered=False,  # updated by corrector if recovery works
+                was_recovered=was_recovered,
                 task_id=self._task.id,
             )
         except Exception as exc:

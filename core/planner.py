@@ -54,12 +54,13 @@ Each step must have exactly these fields:
 Rules:
 1. Always start with a navigate step unless the browser is already on the right page.
 2. Use the minimum number of steps to achieve the goal.
-3. Use extract_page when you need to read content but don't know the exact selector.
-4. Use extract with a specific selector when you know exactly where the data is.
-5. Use click_text instead of click when you don't know the CSS selector.
-6. The last step must extract or return the information requested in the goal.
-7. Do not include steps that verify success — the system handles that separately.
-8. Maximum 15 steps. If a goal requires more, break it into the core path only.
+3. If MEMORY shows a tool that worked for this goal type, USE THAT TOOL. Do not invent a different approach.
+4. Use extract_page when you need to read content but don't know the exact selector.
+5. Use extract with a specific selector ONLY when you are certain the selector exists on the page.
+6. Use click_text instead of click when you don't know the CSS selector.
+7. The last step must extract or return the information requested in the goal.
+8. Do not include steps that verify success — the system handles that separately.
+9. Maximum 15 steps. If a goal requires more, break it into the core path only.
 
 Example response for goal "Go to wikipedia and find when Python was created":
 [
@@ -243,19 +244,42 @@ def _build_prompt(goal: str, memory_ctx: PlanningContext) -> str:
     parts.append(get_tool_catalog())
 
     if memory_ctx.has_prior_context:
-        parts.append("MEMORY — past successful tasks similar to this goal:")
-        for task in memory_ctx.similar_tasks[:3]:
-            parts.append(f"  Goal: {task['goal']}")
-            parts.append(f"  Result: {task['result']}")
+        parts.append("=== MEMORY: PAST EXPERIENCE FOR THIS EXACT TYPE OF TASK ===")
+        parts.append("")
+
+        if memory_ctx.similar_tasks:
+            parts.append("PREVIOUSLY COMPLETED TASKS (use these as templates):")
+            for task in memory_ctx.similar_tasks[:3]:
+                parts.append(f"  Goal: {task['goal']}")
+                parts.append(f"  Result: {task['result']}")
+                parts.append(f"  Steps taken: {task.get('steps_taken', '?')}")
             parts.append("")
 
         if memory_ctx.recent_successes:
-            parts.append("MEMORY — recent successful actions for this goal type:")
-            for action in memory_ctx.recent_successes[:3]:
-                parts.append(f"  Tool: {action['tool']}, Context: {action['context']}")
+            # Group by tool to show which tools worked
+            successful_tools = {}
+            for action in memory_ctx.recent_successes[:5]:
+                tool = action['tool']
+                if tool not in successful_tools:
+                    successful_tools[tool] = action
+            
+            parts.append("TOOLS THAT WORKED FOR THIS GOAL TYPE (prefer these):")
+            for tool, action in successful_tools.items():
+                parts.append(f"  - {tool}: {action['context'][:80]}")
             parts.append("")
 
-    parts.append("Now generate the step-by-step plan as a JSON array:")
+            # Check if extract_page is in the successful tools
+            if 'extract_page' in successful_tools:
+                parts.append("IMPORTANT: extract_page has worked for this goal type before.")
+                parts.append("Prefer extract_page over extract with CSS selectors unless you are")
+                parts.append("certain the selector exists on this specific site.")
+                parts.append("")
+
+        parts.append("=== END MEMORY ===")
+        parts.append("")
+
+    parts.append("Generate the step-by-step plan as a JSON array.")
+    parts.append("If memory above shows extract_page worked, use extract_page as the last step.")
 
     return "\n".join(parts)
 
