@@ -1,25 +1,15 @@
 """
-main.py
-
-CLI entry point for AGENTX.
+main.py — AGENTX CLI entry point.
 
 Usage
 -----
-    # Run a task:
-    python main.py "Go to news.ycombinator.com and return the top post title"
-
-    # Start the API server:
+    python main.py "your goal here"
     python main.py --serve
-
-    # Check system health:
     python main.py --health
-
-    # Week 2 browser smoke test:
-    python main.py --browse "https://en.wikipedia.org/wiki/Python_(programming_language)"
-
-Week 1: creates a Task record, writes it to SQLite, prints the task_id.
-Week 2: --browse opens a real browser and extracts page text.
-Week 3: adds Orchestrator call so the agent actually executes the goal.
+    python main.py --browse https://example.com
+    python main.py --benchmark
+    python main.py --benchmark --suite easy
+    python main.py --benchmark --ids nav_001,extract_001,nav_002
 """
 
 from __future__ import annotations
@@ -43,39 +33,32 @@ def _parse_args() -> argparse.Namespace:
         nargs="?",
         help="Natural language goal for the agent to execute.",
     )
-    parser.add_argument(
-        "--serve",
-        action="store_true",
-        help="Start the FastAPI server instead of running a task.",
-    )
-    parser.add_argument(
-        "--health",
-        action="store_true",
-        help="Check system health and exit.",
-    )
-    parser.add_argument(
-        "--browse",
-        metavar="URL",
-        help="Week 2 smoke test: open URL, exercise all browser actions.",
-    )
-    parser.add_argument(
-        "--goal-type",
-        default="unknown",
+    parser.add_argument("--serve", action="store_true",
+        help="Start the FastAPI server.")
+    parser.add_argument("--health", action="store_true",
+        help="Check system health and exit.")
+    parser.add_argument("--browse", metavar="URL",
+        help="Browser smoke test: navigate URL and exercise all actions.")
+    parser.add_argument("--benchmark", action="store_true",
+        help="Run the benchmark suite.")
+    parser.add_argument("--suite", default="full",
+        choices=["full", "easy", "medium", "hard"],
+        help="Benchmark suite to run (default: full).")
+    parser.add_argument("--category", default=None,
+        help="Filter benchmark to one category.")
+    parser.add_argument("--ids", default=None,
+        help="Comma-separated benchmark task IDs to run (e.g. nav_001,nav_002).")
+    parser.add_argument("--timeout", type=int, default=120,
+        help="Per-task benchmark timeout in seconds (default: 120).")
+    parser.add_argument("--goal-type", default="unknown",
         choices=["navigation", "extraction", "form_interaction", "multi_step", "unknown"],
-        help="Goal category hint for the planner (default: unknown).",
-    )
-    parser.add_argument(
-        "--host",
-        default=settings.api_host,
-        help=f"API server host (default: {settings.api_host}).",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=settings.api_port,
-        help=f"API server port (default: {settings.api_port}).",
-    )
+        help="Goal category hint for the planner.")
+    parser.add_argument("--host", default=settings.api_host)
+    parser.add_argument("--port", type=int, default=settings.api_port)
     return parser.parse_args()
+
+
+# ── Handlers ──────────────────────────────────────────────────────────────────
 
 
 async def run_health_check() -> None:
@@ -98,26 +81,16 @@ async def run_health_check() -> None:
     if not llm_ok:
         print(f"\n  [!] LLM unavailable. Run: ollama serve && ollama pull {settings.llm_model}")
         sys.exit(1)
-
     print("\n  System ready.")
 
 
 async def run_browse(url: str) -> None:
-    """
-    Week 2 smoke test.
-
-    Opens a real browser, navigates to the URL, runs every action
-    once, prints results. Confirms the browser layer works end-to-end
-    before the Planner and Execution Engine are built.
-    """
     from browser.controller import BrowserController
 
     print(f"\n  Opening browser → {url}")
     print("  " + "─" * 50)
 
     async with BrowserController() as browser:
-
-        # 1. navigate
         result = await browser.navigate(url)
         if not result.success:
             print(f"  [FAIL] navigate: {result.error}")
@@ -125,55 +98,43 @@ async def run_browse(url: str) -> None:
         print(f"  [OK]   navigate   → title: {result.output['title'][:60]}")
         print(f"                      url:   {result.output['url'][:60]}")
 
-        # 2. extract_page — full readable text
         result = await browser.extract_page()
-        if not result.success:
-            print(f"  [FAIL] extract_page: {result.error}")
-        else:
-            text = result.output["text"]
-            preview = text[:300].replace("\n", " ")
+        if result.success:
+            preview = result.output["text"][:300].replace("\n", " ")
             print(f"  [OK]   extract_page → {result.output['char_count']} chars")
             print(f"                        preview: {preview!r}")
+        else:
+            print(f"  [FAIL] extract_page: {result.error}")
 
-        # 3. get_links
         result = await browser.get_links()
-        if not result.success:
-            print(f"  [FAIL] get_links: {result.error}")
-        else:
-            links = result.output["links"]
+        if result.success:
             print(f"  [OK]   get_links   → {result.output['count']} links found")
-            for link in links[:3]:
+            for link in result.output["links"][:3]:
                 print(f"                        {link['text'][:30]!r:32} → {link['href'][:50]}")
+        else:
+            print(f"  [FAIL] get_links: {result.error}")
 
-        # 4. get_dom_snapshot
         result = await browser.get_dom_snapshot()
-        if not result.success:
-            print(f"  [FAIL] get_dom_snapshot: {result.error}")
-        else:
+        if result.success:
             snap = result.output["snapshot"]
-            first_lines = "\n".join(snap.splitlines()[:6])
             print(f"  [OK]   dom_snapshot → {len(snap.splitlines())} lines")
-            print(f"         {first_lines[:200]}")
-
-        # 5. scroll
-        result = await browser.scroll("down", 300)
-        if not result.success:
-            print(f"  [FAIL] scroll: {result.error}")
+            print(f"         {chr(10).join(snap.splitlines()[:4])}")
         else:
+            print(f"  [FAIL] dom_snapshot: {result.error}")
+
+        result = await browser.scroll("down", 300)
+        if result.success:
             print(f"  [OK]   scroll      → scrollY: {result.output['scroll_y']}px")
 
         result = await browser.screenshot()
-        if not result.success:
-            print(f"  [FAIL] screenshot: {result.error}")
-        else:
-            print(f"  [OK]   screenshot  → {result.output['size']:,} bytes (PNG)")
+        if result.success:
+            print(f"  [OK]   screenshot  → {result.output['size']:,} bytes")
 
         print()
-        print(f"  current url:   {await browser.current_url()}")
-        print(f"  current title: {await browser.current_title()}")
+        print(f"  url:   {await browser.current_url()}")
+        print(f"  title: {await browser.current_title()}")
         print()
         print("  Browser layer: ALL ACTIONS OK")
-        print("  Week 2 exit criterion met.")
 
 
 async def run_goal(goal: str, goal_type: str) -> None:
@@ -182,44 +143,72 @@ async def run_goal(goal: str, goal_type: str) -> None:
     logger = get_logger(__name__)
     logger.info("goal_submitted", goal=goal[:80], goal_type=goal_type)
 
-    print(f"\n  Goal:      {goal}")
-    print(f"  Type:      {goal_type}")
-    print(f"  Model:     {settings.llm_model}")
+    print(f"\n  Goal:  {goal}")
+    print(f"  Type:  {goal_type}  |  Model: {settings.llm_model}")
     print()
 
-    orchestrator = Orchestrator()
-    task = await orchestrator.run(goal=goal, goal_type=goal_type)
+    task = await Orchestrator().run(goal=goal, goal_type=goal_type)
 
     print()
     print("  " + "═" * 50)
     print(f"  Task ID:     {task.id}")
-    print(f"  Status:      {task.status.value}")
-    print(f"  Steps:       {task.steps_taken}")
-    print(f"  Corrections: {task.corrections}")
-    print(f"  Tokens:      {task.tokens_used}")
+    print(f"  Status:      {task.status.value if hasattr(task.status, 'value') else task.status}")
+    print(f"  Steps:       {task.steps_taken}  |  Corrections: {task.corrections}  |  Tokens: {task.tokens_used}")
     if task.duration_seconds:
         print(f"  Duration:    {task.duration_seconds:.1f}s")
     print()
     print("  RESULT:")
     print("  " + "─" * 50)
-    print(f"  {task.result}")
+    # Trim long results — show first meaningful lines only
+    result_text = (task.result or "").strip()
+    lines = [l for l in result_text.splitlines() if l.strip()][:15]
+    for line in lines:
+        print(f"  {line}")
+    if len(result_text.splitlines()) > 15:
+        print(f"  ... ({len(result_text.splitlines())} lines total)")
     print("  " + "═" * 50)
+
+
+async def run_benchmark(
+    suite: str,
+    category: str | None,
+    ids: str | None,
+    timeout: int,
+) -> None:
+    from evaluation.benchmark_runner import BenchmarkRunner
+    from evaluation.metrics import MetricsCalculator
+    from evaluation.reporter import Reporter
+
+    task_ids = [x.strip() for x in ids.split(",")] if ids else None
+
+    runner = BenchmarkRunner(
+        suite=suite,
+        category=category,
+        task_ids=task_ids,
+        timeout=timeout,
+    )
+    results = await runner.run()
+
+    if not results:
+        print("  No results. Check --suite / --ids / dataset.json.")
+        return
+
+    summary = MetricsCalculator.compute(results, run_id=runner._run_id)
+    reporter = Reporter()
+    reporter.print_report(summary, results)
+    reporter.save_report(summary, results, runner._run_id)
 
 
 def serve(host: str, port: int) -> None:
     import uvicorn
-    uvicorn.run(
-        "api.app:app",
-        host=host,
-        port=port,
-        reload=False,
-        log_config=None,
-    )
+    uvicorn.run("api.app:app", host=host, port=port, reload=False, log_config=None)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 
 def main() -> None:
     args = _parse_args()
-
     setup_logging()
     init_db()
 
@@ -238,11 +227,18 @@ def main() -> None:
         asyncio.run(run_browse(args.browse))
         return
 
+    if args.benchmark:
+        asyncio.run(run_benchmark(args.suite, args.category, args.ids, args.timeout))
+        return
+
     if not args.goal:
-        print("Usage: python main.py \"your goal here\"")
-        print("       python main.py --serve")
-        print("       python main.py --health")
-        print("       python main.py --browse https://example.com")
+        print("Usage:")
+        print("  python main.py \"your goal here\"")
+        print("  python main.py --benchmark --suite easy")
+        print("  python main.py --benchmark --ids nav_001,nav_002,extract_001")
+        print("  python main.py --serve")
+        print("  python main.py --health")
+        print("  python main.py --browse https://example.com")
         sys.exit(1)
 
     asyncio.run(run_goal(args.goal, args.goal_type))

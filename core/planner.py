@@ -10,13 +10,22 @@ The Planner is where AI engineering depth lives:
 
 Flow:
   1. Query memory for similar tasks and past successful actions
+     (memory is pre-trimmed to MEMORY_CONTEXT_TOKEN_BUDGET in retrieval.py)
   2. Build a prompt: system instructions + tool catalog + memory + goal
-  3. Call the LLM
-  4. Parse the JSON step list from the response
-  5. Construct and return an ExecutionDAG
+  3. Log the estimated prompt token count (visible in logs during benchmark)
+  4. Call the LLM
+  5. Parse the JSON step list from the response
+  6. Construct and return an ExecutionDAG
 
 The LLM is asked to respond with a JSON array of steps only.
 No prose, no explanation — just the plan. This makes parsing reliable.
+
+PROMPT SIZE GUARANTEE
+---------------------
+_build_prompt() logs a WARNING if the assembled prompt exceeds
+1,400 estimated tokens. This should never fire after the retrieval.py
+token budget fix, but the warning gives immediate visibility if
+something slips through (e.g. a very long goal string or tool catalog).
 """
 
 from __future__ import annotations
@@ -24,14 +33,19 @@ from __future__ import annotations
 import json
 import re
 
-from core.models import ExecutionDAG, GoalType, Step
+from core.models import ExecutionDAG, Step
 from llm.factory import get_llm_client
-from llm.base import LLMResponse
 from memory.retrieval import PlanningContext, get_planning_context
-from tools.registry import get_tool_catalog
+from tools.registry import get_tool_catalog, get_tool
 from log.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Warn if assembled prompt exceeds this estimated token count.
+# Memory context is capped at 800 tokens by retrieval.py.
+# Tool catalog ~300 tokens. Instructions ~300 tokens. Total budget: ~1,400.
+_PROMPT_TOKEN_WARN_THRESHOLD: int = 1_400
+
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
@@ -84,12 +98,12 @@ class Planner:
     def __init__(self) -> None:
         self._client = get_llm_client()
 
-    async def plan(self, goal: str, goal_type: str = "unknown") -> ExecutionDAG:
+    async def plan(self, goal: str, goal_type: str = "unknown") -> tuple[ExecutionDAG, int]:
         """
         Generate an ExecutionDAG for the given goal.
 
-        Queries memory for relevant past context, builds a prompt,
-        calls the LLM, parses the response into Steps.
+        Queries memory for relevant past context (pre-trimmed to token budget),
+        builds a prompt, calls the LLM, parses the response into Steps.
 
         Parameters
         ----------
@@ -98,7 +112,7 @@ class Planner:
 
         Returns
         -------
-        ExecutionDAG with steps ready for the Execution Engine.
+        Tuple of (ExecutionDAG, total_tokens_used).
 
         Raises
         ------
@@ -107,10 +121,10 @@ class Planner:
         """
         logger.info("planner_start", goal=goal[:80], goal_type=goal_type)
 
-        # Retrieve memory context
+        # Retrieve memory context — pre-trimmed to MEMORY_CONTEXT_TOKEN_BUDGET
         ctx = get_planning_context(goal=goal, goal_type=goal_type)
 
-        # Build prompt
+        # Build prompt and check size
         prompt = _build_prompt(goal=goal, memory_ctx=ctx)
 
         # Call LLM
@@ -148,7 +162,7 @@ class Planner:
         completed_steps: list[Step],
         failed_step: Step,
         page_text: str,
-    ) -> ExecutionDAG:
+    ) -> tuple[ExecutionDAG, int]:
         """
         Regenerate the plan from the current position after a failure.
 
@@ -163,10 +177,11 @@ class Planner:
         completed_steps : Steps that already succeeded.
         failed_step     : The step that failed.
         page_text       : Current page text (from extract_page).
+                          Truncated to 3,000 chars inside this method.
 
         Returns
         -------
-        New ExecutionDAG containing only the remaining steps.
+        Tuple of (new ExecutionDAG with remaining steps, total_tokens_used).
         """
         logger.info("planner_replan", failed_tool=failed_step.tool, goal=goal[:80])
 
@@ -205,6 +220,8 @@ Do NOT repeat the steps that already succeeded.
 If the answer is visible in the page content above, use extract_page to get it.
 Respond with ONLY a JSON array of remaining steps."""
 
+        _warn_if_oversized(prompt, context="replan")
+
         try:
             response = await self._client.complete(
                 prompt=prompt,
@@ -230,10 +247,17 @@ def _build_prompt(goal: str, memory_ctx: PlanningContext) -> str:
     """
     Assemble the user-turn prompt from goal + tool catalog + memory.
 
+    Memory context records are pre-trimmed by retrieval.get_planning_context().
+    This function only formats them — it does not further truncate.
+
+    Logs a WARNING if the assembled prompt exceeds _PROMPT_TOKEN_WARN_THRESHOLD.
+    This warning should never fire after the retrieval.py token budget fix,
+    but provides a safety net and visibility during benchmark runs.
+
     Structured in order of importance:
       1. Goal (most important — LLM reads top-down)
       2. Available tools
-      3. Memory context (if any)
+      3. Memory context (if any — always fits within budget)
     """
     parts: list[str] = []
 
@@ -257,21 +281,24 @@ def _build_prompt(goal: str, memory_ctx: PlanningContext) -> str:
 
         if memory_ctx.recent_successes:
             # Group by tool to show which tools worked
-            successful_tools = {}
+            successful_tools: dict[str, dict] = {}
             for action in memory_ctx.recent_successes[:5]:
-                tool = action['tool']
+                tool = action["tool"]
                 if tool not in successful_tools:
                     successful_tools[tool] = action
-            
+
             parts.append("TOOLS THAT WORKED FOR THIS GOAL TYPE (prefer these):")
             for tool, action in successful_tools.items():
                 parts.append(f"  - {tool}: {action['context'][:80]}")
             parts.append("")
 
-            # Check if extract_page is in the successful tools
-            if 'extract_page' in successful_tools:
-                parts.append("IMPORTANT: extract_page has worked for this goal type before.")
-                parts.append("Prefer extract_page over extract with CSS selectors unless you are")
+            if "extract_page" in successful_tools:
+                parts.append(
+                    "IMPORTANT: extract_page has worked for this goal type before."
+                )
+                parts.append(
+                    "Prefer extract_page over extract with CSS selectors unless you are"
+                )
                 parts.append("certain the selector exists on this specific site.")
                 parts.append("")
 
@@ -279,9 +306,37 @@ def _build_prompt(goal: str, memory_ctx: PlanningContext) -> str:
         parts.append("")
 
     parts.append("Generate the step-by-step plan as a JSON array.")
-    parts.append("If memory above shows extract_page worked, use extract_page as the last step.")
+    parts.append(
+        "If memory above shows extract_page worked, use extract_page as the last step."
+    )
 
-    return "\n".join(parts)
+    result = "\n".join(parts)
+    _warn_if_oversized(result, context="plan")
+    return result
+
+
+def _warn_if_oversized(prompt: str, context: str = "prompt") -> None:
+    """
+    Log a WARNING if the prompt exceeds the safe token threshold.
+
+    Does NOT block execution — just makes the problem visible in logs.
+    A firing warning means retrieval.py's budget enforcement needs review.
+    """
+    estimated = len(prompt) // 4
+    if estimated > _PROMPT_TOKEN_WARN_THRESHOLD:
+        logger.warning(
+            "prompt_budget_exceeded",
+            context=context,
+            estimated_tokens=estimated,
+            threshold=_PROMPT_TOKEN_WARN_THRESHOLD,
+            prompt_chars=len(prompt),
+        )
+    else:
+        logger.debug(
+            "prompt_size_ok",
+            context=context,
+            estimated_tokens=estimated,
+        )
 
 
 # ── Response parser ───────────────────────────────────────────────────────────
@@ -295,10 +350,11 @@ def _parse_steps(content: str) -> list[Step]:
     explanatory text before/after. This parser is forgiving:
     it finds the first [ ... ] block in the response and parses that.
 
-    Returns empty list if no valid JSON array of steps found.
+    Returns empty list if no valid JSON array of steps is found.
     """
-    # Try direct parse first (ideal case — LLM returned pure JSON)
     content = content.strip()
+
+    # Try direct parse first (ideal case — LLM returned pure JSON)
     try:
         data = json.loads(content)
         return _validate_and_build(data)
@@ -342,7 +398,6 @@ def _validate_and_build(data: object) -> list[Step]:
         return []
 
     steps: list[Step] = []
-    from tools.registry import get_tool
 
     for i, item in enumerate(data):
         if not isinstance(item, dict):

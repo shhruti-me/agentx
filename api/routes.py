@@ -228,14 +228,52 @@ async def get_tasks(
 # ── Benchmark stubs (Week 6) ──────────────────────────────────────────────────
 
 
+class BenchmarkRequest(BaseModel):
+    suite: str = Field(default="full", description="full | easy | medium | hard")
+    category: str | None = Field(default=None)
+    ids: str | None = Field(default=None, description="Comma-separated task IDs")
+    timeout: int = Field(default=120, ge=10, le=600)
+
+
 @router.post(
     "/v1/benchmark",
     tags=["evaluation"],
     dependencies=[Depends(require_api_key)],
 )
-async def start_benchmark(request: Request) -> dict:
-    """Stub — implemented in Week 6 when BenchmarkRunner exists."""
-    raise HTTPException(status_code=501, detail="Benchmark runner not implemented yet. Coming in Week 6.")
+async def start_benchmark(body: BenchmarkRequest, request: Request) -> dict:
+    """
+    Start a benchmark run. Returns run_id immediately.
+    Poll /v1/benchmark/{run_id} for results.
+    Note: runs synchronously for now — response returns when complete.
+    """
+    from evaluation.benchmark_runner import BenchmarkRunner
+    from evaluation.metrics import MetricsCalculator
+
+    task_ids = [x.strip() for x in body.ids.split(",")] if body.ids else None
+    runner = BenchmarkRunner(
+        suite=body.suite,
+        category=body.category,
+        task_ids=task_ids,
+        timeout=body.timeout,
+    )
+
+    results = await runner.run()
+    summary = MetricsCalculator.compute(results, run_id=runner._run_id)
+
+    return ok(
+        {
+            "run_id": runner._run_id,
+            "total_tasks": summary.total_tasks,
+            "passed": summary.passed,
+            "partial": summary.partial,
+            "failed": summary.failed,
+            "task_success_rate": round(summary.task_success_rate * 100, 1),
+            "avg_corrections_per_task": round(summary.avg_corrections_per_task, 2),
+            "avg_tokens_per_task": round(summary.avg_tokens_per_task),
+            "avg_time_per_task": round(summary.avg_time_per_task, 1),
+        },
+        request,
+    )
 
 
 @router.get(
@@ -244,5 +282,24 @@ async def start_benchmark(request: Request) -> dict:
     dependencies=[Depends(require_api_key)],
 )
 async def get_benchmark(run_id: str, request: Request) -> dict:
-    """Stub — implemented in Week 6."""
-    raise HTTPException(status_code=501, detail="Benchmark runner not implemented yet. Coming in Week 6.")
+    """Retrieve stored results for a past benchmark run."""
+    from memory.db import get_connection
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM benchmark_results WHERE run_id = ? ORDER BY ran_at",
+            (run_id,),
+        ).fetchall()
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Run {run_id!r} not found.")
+    results = [dict(r) for r in rows]
+    passed = sum(1 for r in results if r["status"] == "pass")
+    return ok(
+        {
+            "run_id": run_id,
+            "total": len(results),
+            "passed": passed,
+            "task_success_rate": round(passed / len(results) * 100, 1),
+            "results": results,
+        },
+        request,
+    )
