@@ -1,8 +1,8 @@
 # AGENTX
 
-**An autonomous browser agent with LLM-based planning, real Playwright execution, multi-method verification, and self-correction — backed by a SQLite memory system that lets it learn from its own history.**
+**An autonomous browser agent with LLM-based planning, real browser execution, multi-method verification, and self-correction — backed by a SQLite memory system that improves planning over time.**
 
-Solo-developer portfolio project. Zero paid infrastructure. One SQLite file. No Redis, no VectorDB, no Kubernetes, no microservices — every component here exists because it demonstrably improves task completion, recovery rate, or verification accuracy, not because it looks impressive on a diagram.
+AGENTX accepts a natural language goal, decomposes it into an executable plan, drives a real browser to carry it out, verifies each step actually succeeded, and recovers from failures by classifying what went wrong and selecting a correction strategy. Every action — success or failure — is persisted, and future plans are biased toward what has already worked.
 
 ```
 Goal (natural language)
@@ -36,80 +36,91 @@ ExecutionDAG (ordered steps)
 
 ---
 
-## What this actually is
+## How it works
 
-You give it a goal like:
+Give it a goal:
 
 ```bash
 python main.py "Go to en.wikipedia.org/wiki/Python_(programming_language) and return the year Python was first released"
 ```
 
-It plans a sequence of browser steps with an LLM, executes them with a real headless Chromium browser, verifies each step actually succeeded (not just "no exception was thrown"), and — if a step fails — classifies *why* it failed and picks a recovery strategy instead of just crashing. Every action it takes, successful or not, is written to SQLite so future runs can plan better.
+The **Planner** converts that into a JSON step list via an LLM call, first querying memory for similar past tasks and tools that have worked for this goal type and injecting that as few-shot context. No embeddings — plain SQL keyword matching (`tasks.goal LIKE '%keyword%'`, `action_successes.goal_type = ?`) is enough to bias planning toward known-working approaches.
 
----
+The **Execution Engine** walks the resulting `ExecutionDAG` step by step, resolves each step's tool from a static registry, and dispatches it to the **Browser Controller** — a Playwright facade that exposes `navigate`, `click`, `click_text`, `type`, `scroll`, `extract`, `extract_page`, `get_links`, `get_dom_snapshot`, and `screenshot`. Nothing outside `browser/` ever imports Playwright directly, and every action returns an `ActionResult` rather than raising across the boundary.
 
-## Why it's built this way
+Each step result is checked by the **Verification Engine**, a cost-ordered Chain of Responsibility:
 
-The full design rationale — including a line-by-line list of what was deliberately **not** built (Postgres, Redis, VectorDB, Celery, session pooling, Kubernetes, etc.) and why — lives in [`AGENTX — Architecture Design Document`](./AGENTX___Architecture_Design_Document). Two rules from that document govern every decision in this codebase:
+1. **DOM Verifier** — structural checks (URL changed, title matches, element appeared/disappeared). Zero token cost.
+2. **Text Verifier** — keyword and failure-signal matching against extracted page text. Zero token cost.
+3. **LLM Verifier** — only invoked when the first two return `UNCERTAIN`. Sends the expected outcome and page content to the LLM and asks it to judge pass/fail with a confidence score.
 
-1. **Every component maps to a concept an AI/agent-systems interviewer would ask about.** If it doesn't, it's cut.
-2. **Nothing gets added unless it moves a measurable number** — task success rate, recovery rate, or verification accuracy. Complexity that doesn't move a benchmark is complexity that shouldn't exist.
+`UNCERTAIN` from all three is treated as `FAIL` — the system never silently assumes success.
+
+On failure, the **Self-Correction Engine** classifies the failure type (`stale_selector`, `timeout`, `auth_wall`, `wrong_page`, `extraction_empty`, `plan_error`, `unknown`) and walks a per-failure-type priority list of strategies, skipping anything already tried in this task session:
+
+- **`RETRY`** — re-run the exact step. Transient failures only.
+- **`SELECTOR_FIX`** — ask the LLM for an alternative CSS selector using live DOM/HTML context, with an explicit constraint that it cannot return the same broken selector.
+- **`REPLAN`** — call `Planner.replan()` with the current page state to regenerate the plan from the failure point forward.
+- **`ABORT`** — mark the task failed with a clear reason. Used for auth walls, CAPTCHAs, and exhausted retries.
+
+Every success and failure is written to SQLite, closing the loop back into the Planner and Correction Engine for the next run.
 
 ---
 
 ## Architecture
 
-### The pipeline
+### Core components
 
-1. **Planner** (`core/planner.py`) — Converts the goal into a JSON step list via the LLM. Before calling the LLM, it queries Memory for similar past tasks and tools that worked for this goal type, and injects that as few-shot context. No embeddings — plain SQL keyword matching against `tasks.goal LIKE '%keyword%'` and `action_successes.goal_type = ?`. On failure mid-run, `replan()` regenerates the remaining steps from the current page state.
-
-2. **Execution Engine** (`core/execution_engine.py`) — Walks the `ExecutionDAG` sequentially, resolves each step's tool from the static `TOOL_REGISTRY`, dispatches to the Browser Controller, and hands the result to the Verifier. On `FAIL`, control passes to the Self-Correction Engine; on `REPLAN`, the remaining DAG is swapped and execution continues from the failure point.
-
-3. **Browser Controller** (`browser/controller.py`, `browser/actions.py`) — A Playwright facade. Nothing outside `browser/` imports Playwright directly. Exposes `navigate`, `click`, `click_text`, `type`, `scroll`, `extract`, `extract_page`, `get_links`, `get_dom_snapshot`, `screenshot`. Every action returns an `ActionResult` — nothing raises across the boundary.
-
-4. **Verification Engine** (`verification/`) — Chain of Responsibility, cheapest-first:
-   - **DOM Verifier** — URL/title/structural checks, zero token cost.
-   - **Text Verifier** — keyword/failure-signal matching against extracted page text, zero token cost.
-   - **LLM Verifier** — only called when the first two return `UNCERTAIN`. Asks the LLM "did this step achieve its goal?" and parses a `{result, confidence, reason}` JSON verdict.
-   
-   All-`UNCERTAIN` is treated as `FAIL` — the system never silently assumes success.
-
-5. **Self-Correction Engine** (`correction/`) — Classifies the failure (`stale_selector`, `timeout`, `auth_wall`, `wrong_page`, `extraction_empty`, `plan_error`, `unknown`) and walks a per-failure-type priority list of strategies, skipping any already tried in this task session (per `action_failures` history):
-   - `RETRY` — re-run the exact step (transient failures).
-   - `SELECTOR_FIX` — ask the LLM for an alternative CSS selector using live DOM/HTML context, with an explicit rule that it cannot return the same broken selector.
-   - `REPLAN` — call `Planner.replan()` with the current page state.
-   - `ABORT` — mark the task failed with a clear reason (auth walls, CAPTCHAs, exhausted retries).
-
-6. **Memory** (`memory/`) — One SQLite file, three read/write stores plus a composite retrieval layer:
-   - `task_memory.py` — full task lifecycle records.
-   - `action_memory.py` — successful tool invocations, scoped by goal type and site domain, used to bias future plans.
-   - `failure_memory.py` — every failure + correction attempt + outcome, scoped per task, used to prevent retrying a strategy that already failed in this session.
-   - `retrieval.py` — the only interface the Planner and Correction Engine use; they never touch raw SQL.
-
-7. **LLM abstraction** (`llm/`) — `LLMProvider` ABC with a single `complete()` entry point. `llm/factory.py` picks the concrete provider from `LLM_PROVIDER` in `.env`. **Ollama + Qwen3, running locally, is the default and only zero-cost, zero-API-key option** — this is intentional so the whole project runs for $0. Anthropic, OpenAI, and Groq are drop-in alternatives behind the same interface; switching providers is a one-line `.env` change, never a code change.
-
-### Design patterns in use
-
-| Pattern | Where |
+| Component | Responsibility |
 |---|---|
-| Strategy | Correction strategies (`retry`, `selector_fix`, `replan`, `abort`) are swappable functions |
-| Chain of Responsibility | DOM → Text → LLM verifiers |
-| Repository | Every memory module exposes only named functions — no raw SQL leaks outside `memory/` |
-| Facade | `BrowserController` hides all of Playwright |
-| Command | Every browser action is a discrete, logged, independently-testable function |
-| Factory | `tools/registry.py` resolves tool name → handler; `llm/factory.py` resolves provider |
+| **Orchestrator** (`core/orchestrator.py`) | Top-level pipeline coordinator: intake → plan → execute → report. Owns task lifecycle only. |
+| **Planner** (`core/planner.py`) | Goal → `ExecutionDAG`. Retrieval-augmented prompting, structured JSON parsing, replan-on-failure. |
+| **Execution Engine** (`core/execution_engine.py`) | DAG traversal, step dispatch, retry state, step timing. |
+| **Browser Controller** (`browser/controller.py`, `browser/actions.py`) | Playwright session lifecycle and action dispatch behind a clean facade. |
+| **Tool Registry** (`tools/registry.py`) | Static name → handler mapping. The Planner reads tool descriptions to construct valid steps. |
+| **Verification Engine** (`verification/`) | Three-method chain producing `PASS` / `FAIL` / `UNCERTAIN` with confidence and reasoning. |
+| **Self-Correction Engine** (`correction/`) | Failure classification, strategy selection, recovery execution. |
+| **Memory** (`memory/`) | SQLite-backed task, action-success, and action-failure stores plus a composite retrieval layer. |
+| **LLM Layer** (`llm/`) | Provider-agnostic interface (`LLMProvider` ABC) with pluggable backends. |
+| **Logger** (`log/logger.py`) | Structured JSON logging to stdout and rotating file, stdlib only. |
+| **API** (`api/`) | FastAPI surface: `/v1/run`, `/v1/status/{id}`, `/v1/results/{id}`, `/v1/tasks`, `/health`. |
+
+### Design patterns
+
+| Pattern | Where applied |
+|---|---|
+| **Strategy** | Correction strategies (`retry`, `selector_fix`, `replan`, `abort`) are independently swappable functions |
+| **Chain of Responsibility** | DOM → Text → LLM verifiers, ordered cheapest-first |
+| **Repository** | Every memory module exposes only named functions — no raw SQL leaks outside `memory/` |
+| **Facade** | `BrowserController` hides the full Playwright API behind a minimal interface |
+| **Command** | Every browser action is a discrete, named, independently-testable operation |
+| **Factory** | `tools/registry.py` resolves tool name → handler; `llm/factory.py` resolves LLM provider |
+
+### Data model
+
+Core dataclasses in `core/models.py`: `Task`, `Step`, `ExecutionDAG`, `ActionResult`, `VerificationResult`, `CorrectionResult`, plus the `TaskStatus`, `StepStatus`, `GoalType`, `VerificationStatus`, `FailureType`, and `CorrectionStrategy` enums. Every module in the system imports its types from here — no module defines its own task or step shape.
 
 ---
 
 ## Database
 
-One SQLite file (`db/agentx.db`, gitignored), five tables, `CREATE TABLE IF NOT EXISTS` on startup — no ORM, no migrations:
+One SQLite file, five tables, created via `CREATE TABLE IF NOT EXISTS` on startup:
 
-- **`tasks`** — one row per goal run: status, plan JSON, result, tokens, steps, corrections.
+- **`tasks`** — one row per goal run: status, plan JSON, result, token usage, step/correction counts.
 - **`steps`** — one row per executed step: tool, input/output JSON, status, retry count.
-- **`action_successes`** — successful tool invocations, keyed by goal type + site domain, read by the Planner.
-- **`action_failures`** — every failure + correction attempt + whether it worked, read by the Self-Correction Engine.
-- **`benchmark_results`** — per-task benchmark run output (schema exists; runner not yet built).
+- **`action_successes`** — successful tool invocations keyed by goal type and site domain, read by the Planner before generating a plan.
+- **`action_failures`** — every failure and correction attempt with outcome, read by the Self-Correction Engine to avoid retrying a strategy that already failed in this session.
+- **`benchmark_results`** — per-task benchmark output: status, steps, corrections, tokens, timing.
+
+Retrieval is plain SQL wrapped in named Python functions — no ORM, no query builder.
+
+---
+
+## LLM layer
+
+Every LLM call goes through `LLMProvider.complete()` — no component outside `llm/` imports an HTTP client or a provider SDK directly. `llm/factory.py` resolves the concrete provider from configuration at startup, so switching providers is a config change, not a code change.
+
+Providers: **Ollama** (local, default), **Anthropic**, **OpenAI**, **Groq**. All implementations conform to the same `LLMResponse` shape (`content`, `input_tokens`, `output_tokens`, `model`, `provider`, `latency_ms`), which is what makes cost tracking and benchmark reporting provider-agnostic.
 
 ---
 
@@ -118,8 +129,8 @@ One SQLite file (`db/agentx.db`, gitignored), five tables, `CREATE TABLE IF NOT 
 ### Requirements
 
 - Python 3.12
-- [Ollama](https://ollama.com) running locally (default LLM provider — free, no API key)
-- `playwright install chromium` after installing dependencies
+- [Ollama](https://ollama.com) running locally
+- Playwright's Chromium binary
 
 ### Install
 
@@ -127,12 +138,11 @@ One SQLite file (`db/agentx.db`, gitignored), five tables, `CREATE TABLE IF NOT 
 pip install -r requirements.txt
 playwright install chromium
 
-# Pull the default model
 ollama serve &
 ollama pull qwen3:latest
 ```
 
-Copy `.env.example` to `.env` and adjust if needed — defaults work out of the box with local Ollama.
+Copy `.env.example` to `.env` and adjust as needed.
 
 ### Run a task
 
@@ -146,7 +156,7 @@ python main.py "Go to news.ycombinator.com and return the title of the top post"
 python main.py --health
 ```
 
-### Smoke-test the browser layer only
+### Smoke-test the browser layer
 
 ```bash
 python main.py --browse "https://en.wikipedia.org/wiki/Python_(programming_language)"
@@ -156,38 +166,39 @@ python main.py --browse "https://en.wikipedia.org/wiki/Python_(programming_langu
 
 ```bash
 python main.py --serve
-# then: curl -H "X-API-Key: dev-key-change-in-production" http://127.0.0.1:8000/health
+curl -H "X-API-Key: dev-key-change-in-production" http://127.0.0.1:8000/health
 ```
 
 ---
 
 ## Configuration
 
-All configuration is centralized in `config/settings.py` (Pydantic `BaseSettings`, reads `.env`). Nothing in the codebase calls `os.environ` directly. Key settings:
+All configuration is centralized in `config/settings.py` (Pydantic `BaseSettings`, reads `.env`). No module calls `os.environ` directly.
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `LLM_PROVIDER` | `ollama` | `ollama` \| `anthropic` \| `openai` \| `groq` |
 | `LLM_MODEL` | `qwen3:latest` | Model string passed to the active provider |
 | `LLM_BASE_URL` | `http://localhost:11434` | Ollama endpoint |
-| `BROWSER_HEADLESS` | `true` | Set `false` to watch the agent work |
-| `MAX_RETRIES_PER_STEP` | `3` | Retry ceiling before escalating |
-| `MAX_CORRECTIONS_PER_TASK` | `6` | Hard abort ceiling per task |
+| `BROWSER_HEADLESS` | `true` | Set `false` to watch the agent drive the browser |
+| `MAX_RETRIES_PER_STEP` | `3` | Retry ceiling before escalating to REPLAN/ABORT |
+| `MAX_CORRECTIONS_PER_TASK` | `6` | Hard correction ceiling per task |
 | `DB_PATH` | `db/agentx.db` | SQLite file location |
+| `LOG_LEVEL` | `INFO` | Structured JSON log verbosity |
 
 ---
 
-## Benchmark suite
+## Evaluation
 
 `evaluation/benchmarks/dataset.json` defines 25 tasks across 5 categories, each with a goal, expected-output checks, and step/correction/timeout budgets:
 
-- **Navigation** (5, easy) — basic browser control and extraction.
-- **Data Extraction** (5, easy–medium) — selector accuracy against known pages (e.g. Wikipedia release years, ground-truth checkable).
-- **Form Interaction** (5, medium) — multi-action sequencing, login flows, click-throughs.
-- **Multi-Step** (5, hard) — 5+ sequential actions with intermediate state (cheapest book in a category, etc.).
-- **Error Recovery** (5, hard) — intentionally unstable targets (dynamic search layouts, pagination edges, sort interactions) designed to force the Self-Correction Engine to actually fire.
+- **Navigation** — basic browser control and DOM extraction.
+- **Data Extraction** — selector accuracy against pages with verifiable ground truth (e.g. release years, prices).
+- **Form Interaction** — multi-action sequencing: filling inputs, clicking through, verifying result pages.
+- **Multi-Step** — 5+ sequential actions with intermediate state (comparing prices across a category, pagination).
+- **Error Recovery** — tasks with intentional instability (dynamic layouts, sort interactions, pagination edges) that require the Self-Correction Engine to actually fire.
 
-The runner, metrics calculator, and report generator that consume this dataset (`evaluation/benchmark_runner.py`, `metrics.py`, `reporter.py`) are the next piece to build — `/v1/benchmark` is currently a `501` stub. Once built, a run produces a report like:
+A benchmark run produces a report keyed on task success rate, recovery rate, average steps/corrections per task, and a breakdown of failure types and correction effectiveness — the empirical basis for any claim about how well the agent performs.
 
 ```
 Task Success Rate        72%   (18/25)
@@ -195,8 +206,6 @@ Recovery Rate            81%   (13/16 corrections)
 Avg Steps / Task          6.4
 Avg Corrections / Task    0.64
 ```
-
-This report — not a subjective description of "the agent works" — is what actually validates the system.
 
 ---
 
@@ -212,12 +221,10 @@ agentx/
 ├── verification/            # DOM / text / LLM verifiers + orchestrator
 ├── correction/               # failure classifier, engine, 4 recovery strategies
 ├── memory/                  # SQLite connection + task/action/failure stores + retrieval
-├── llm/                     # provider-agnostic LLM interface (Ollama default)
+├── llm/                     # provider-agnostic LLM interface
 ├── config/                  # Pydantic settings, single source of truth
 ├── log/                     # structured JSON logger, stdlib only
 ├── evaluation/
 │   └── benchmarks/dataset.json   # 25-task benchmark suite
-└── db/                       # agentx.db (gitignored)
+└── db/                       # agentx.db
 ```
-
----
